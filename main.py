@@ -7,13 +7,14 @@ Setup:
         YOUTUBE_API_KEY=your_key
 
 Run:
-    python youtube_collector.py
-    python youtube_collector.py --max-videos 20 --max-comments 500 --out data.xlsx
+    python youtube_collector.py --out data.xlsx
+    python youtube_collector.py --max-videos 15 --max-comments 300 --only-tagged
 
 Rerunning appends only new videos/comments (deduped by ID). Close the
 Excel file before running, or the save will fail.
 """
 import argparse
+import html
 import os
 import re
 
@@ -26,25 +27,36 @@ from openpyxl.utils import get_column_letter
 
 load_dotenv()
 
+# Opinion-oriented queries: reactions, debates, pros/cons, news with public
+# discussion. Tutorials and explainers attract "thank you po" comments, not opinions.
 SEARCH_QUERIES = [
-    "MATATAG curriculum",
-    "MATATAG kurikulum DepEd",
-    "MATATAG curriculum teachers",
-    "K-12 curriculum Philippines",
-    "K to 12 Philippines opinion",
-    "senior high school Philippines removal",
-    "DepEd curriculum review",
-    "MATATAG reaksyon",
+    "MATATAG curriculum teachers react",
+    "MATATAG curriculum pros and cons",
+    "MATATAG curriculum problema teachers",
+    "MATATAG curriculum workload teachers review",
+    "MATATAG kurikulum reaksyon ng guro",
+    "epekto ng MATATAG sa mga estudyante",
+    "DepEd MATATAG news",
+    "K to 12 curriculum failed Philippines",
+    "K-12 program pros and cons Philippines",
+    "senior high school removal Philippines opinion",
+    "K to 12 kurikulum opinyon",
 ]
 
 MATATAG_RE = re.compile(r"matatag|kto10|k\s?to\s?10", re.I)
 K12_RE = re.compile(r"k[\s-]?12|k\s?to\s?12|senior\s?high|\bshs\b", re.I)
+# A video must mention one of these in its title/description to be kept.
+RELEVANT_RE = re.compile(
+    r"matatag|kto10|k[\s-]?12|k\s?to\s?1[02]|senior\s?high|\bshs\b|deped|curriculum|kurikulum",
+    re.I)
 ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # openpyxl rejects these
 
-VIDEO_COLS = ["video_id", "title", "channel_title", "published_at", "query"]
+VIDEO_COLS = ["video_id", "title", "channel_title", "published_at", "query", "comment_count"]
 COMMENT_COLS = ["comment_id", "video_id", "parent_id", "text",
                 "like_count", "published_at", "topic_tag"]
 # Author names are deliberately not stored (privacy, if results get published).
+
+MIN_COMMENT_CHARS = 25  # drops "thank you po", "first", emoji-only comments
 
 
 def clean(v):
@@ -96,12 +108,28 @@ def search_videos(yt, query, max_videos):
         ).execute()
         for item in resp["items"]:
             s = item["snippet"]
-            found.append((item["id"]["videoId"], s["title"],
-                          s["channelTitle"], s["publishedAt"], query))
+            found.append({
+                "id": item["id"]["videoId"],
+                "title": html.unescape(s["title"]),
+                "channel": s["channelTitle"],
+                "published": s["publishedAt"],
+                "desc": s.get("description", ""),
+                "query": query,
+            })
         token = resp.get("nextPageToken")
         if not token:
             break
     return found
+
+
+def comment_counts(yt, ids):
+    """videos.list costs 1 unit per call (50 IDs). Missing count = comments off."""
+    counts = {}
+    for i in range(0, len(ids), 50):
+        resp = yt.videos().list(part="statistics", id=",".join(ids[i:i + 50])).execute()
+        for item in resp["items"]:
+            counts[item["id"]] = int(item["statistics"].get("commentCount", 0))
+    return counts
 
 
 def parse_comment(c, video_id, parent_id):
@@ -138,8 +166,12 @@ def fetch_comments(yt, video_id, max_comments):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-videos", type=int, default=15, help="per query")
+    ap.add_argument("--max-videos", type=int, default=15, help="search results per query")
     ap.add_argument("--max-comments", type=int, default=300, help="per video")
+    ap.add_argument("--min-video-comments", type=int, default=30,
+                    help="skip videos with fewer total comments than this")
+    ap.add_argument("--only-tagged", action="store_true",
+                    help="keep only comments that name MATATAG / K-12 explicitly")
     ap.add_argument("--out", default="matatag_youtube.xlsx")
     args = ap.parse_args()
 
@@ -148,22 +180,35 @@ def main():
 
     for q in SEARCH_QUERIES:
         print(f"[search] {q}")
-        for vid, title, ch, pub, query in search_videos(yt, q, args.max_videos):
-            if vid in seen_videos:
+        candidates = [v for v in search_videos(yt, q, args.max_videos)
+                      if v["id"] not in seen_videos
+                      and RELEVANT_RE.search(v["title"] + " " + v["desc"])]
+        if not candidates:
+            continue
+        counts = comment_counts(yt, [v["id"] for v in candidates])
+        for v in candidates:
+            n = counts.get(v["id"], 0)
+            if n < args.min_video_comments:
+                print(f"  drop {v['id']} ({n} comments): {v['title'][:50]}")
                 continue
-            seen_videos.add(vid)
-            sheets["videos"].append([clean(x) for x in (vid, title, ch, pub, query)])
+            seen_videos.add(v["id"])
+            sheets["videos"].append([clean(x) for x in (
+                v["id"], v["title"], v["channel"], v["published"], v["query"], n)])
             new = 0
-            for row in fetch_comments(yt, vid, args.max_comments):
+            for row in fetch_comments(yt, v["id"], args.max_comments):
                 if row[0] in seen_comments:
+                    continue
+                if len(row[3]) < MIN_COMMENT_CHARS:
+                    continue
+                if args.only_tagged and row[6] == "none":
                     continue
                 seen_comments.add(row[0])
                 sheets["comments"].append([clean(x) for x in row])
                 new += 1
             wb.save(args.out)  # save per video so a crash/quota stop loses nothing
-            print(f"  {vid}: {new} new comments | {title[:60]}")
+            print(f"  {v['id']}: {new} new comments | {v['title'][:60]}")
 
-    set_widths(sheets["videos"], [14, 60, 28, 22, 30])
+    set_widths(sheets["videos"], [14, 60, 28, 22, 30, 14])
     set_widths(sheets["comments"], [28, 14, 28, 90, 10, 22, 12])
     wb.save(args.out)
     print(f"Saved -> {args.out}")
